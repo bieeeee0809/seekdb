@@ -22,6 +22,7 @@
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 #include "storage/fts/ik/ob_ik_processor.h"
+#include "storage/fts/ik/ob_ik_arbitrator.h"
 #include "data_plane/fts/ob_fts_parser.h"
 
 #include <cstdint>
@@ -39,6 +40,7 @@ public:
         is_inited_(false),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
+        ctx_alloc_(nullptr),
         hub_(hub),
         segmenters_(allocator_),
         cache_main_(allocator),
@@ -53,6 +55,13 @@ public:
   virtual ~ObIKFTParser() { reset(); }
 
   int init(const ObFTParserParam &param);
+
+  // 复用已 init 的 parser 处理新文档：只重建 per-document 的 ctx，并 reset 4 个处理器的
+  // mutable 状态，保留 dict / cache container / segmenter（document-independent 部分）。
+  int reuse_init(const ObFTParserParam &param);
+
+  // 归还 parser 前释放 per-document 状态（仅 ctx），不析构 dict / segmenter。
+  void reset_per_doc();
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
@@ -95,8 +104,10 @@ private:
 
   ObCollationType coll_type_;
   TokenizeContext *ctx_;
+  ObIAllocator *ctx_alloc_;
   ObFTDictHub *hub_;
   ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+  ObIKArbitrator arb_;
 
   // For now there's no change of dict in one query, so we can pin dict this level.
   ObFTCacheRangeContainer cache_main_;

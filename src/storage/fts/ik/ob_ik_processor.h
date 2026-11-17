@@ -108,6 +108,9 @@ public:
                          const uint8_t char_len,
                          const ObFTCharUtil::CharType type)
       = 0;
+
+  // 复用 processor：清空跨文档的 mutable 状态，供 parser 实例复用场景调用。
+  virtual void reuse() = 0;
 };
 
 } // namespace storage

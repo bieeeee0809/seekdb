@@ -302,11 +302,25 @@ int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
 
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
+  // 复用场景下 chains_ 已 create（reuse() 已清空 node），首次才需要 create。
+  if (!chains_.created()) {
+    int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
+    cal_bucket_num = MIN(cal_bucket_num, 100);
+    if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
+    }
   }
   return ret;
+}
+
+void ObIKArbitrator::reuse()
+{
+  // 先清空 hashmap node（保留 bucket 数组），再重置 arena 游标（保留 page）。
+  // 注意：alloc_ 里的 ObIKTokenChain 及其 ObList 节点均为 arena 内分配，无需逐个析构；
+  // arena_.reuse() 保留 page 内存仅重置游标，后续分配直接复用同一批 page。
+  if (chains_.created()) {
+    chains_.reuse();
+  }
+  alloc_.reuse();
 }
 
 ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}

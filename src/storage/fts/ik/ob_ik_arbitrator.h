@@ -38,6 +38,10 @@ public:
 
   int output_result(TokenizeContext &ctx);
 
+  // 跨 process 复用：保留 arena page（重置游标）+ hashmap bucket 数组（clear 掉 node），
+  // 避免每 batch 重建 bucket 与 arena page。
+  void reuse();
+
 private:
   int prepare(TokenizeContext &ctx);
 

@@ -18,6 +18,7 @@
 
 #include "src/storage/fts/ob_ik_ft_parser.h"
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
@@ -40,6 +41,30 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// thread_local 复用池：跨 segment() 调用复用同一个 parser 实例（含 dict / cache container /
+// segmenter）。线程本地，天然规避跨线程竞争。key 为 (coll_type, ik_mode)，benchmark 只会有
+// 一份（ik + utf8mb4 + MAX_WORD）。
+struct ObIKFTParserReusePool
+{
+  common::ObArenaAllocator arena_;
+  ObIKFTParser *parser_ = nullptr;
+  ObCollationType coll_type_ = ObCollationType::CS_TYPE_INVALID;
+  uint8_t ik_mode_ = 0xFF;
+
+  ~ObIKFTParserReusePool()
+  {
+    if (OB_NOT_NULL(parser_)) {
+      parser_->~ObIKFTParser();
+      parser_ = nullptr;
+    }
+    // arena_ 随本结构析构时自动释放全部 page。
+  }
+};
+thread_local ObIKFTParserReusePool g_ik_parser_pool;
+} // namespace
+
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -65,6 +90,39 @@ int ObIKFTParser::init(const ObFTParserParam &param)
   }
 
   return ret;
+}
+
+int ObIKFTParser::reuse_init(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (!IS_INIT) {
+    ret = OB_NOT_INIT;
+  } else {
+    // 释放上一文档的 ctx（per-document 状态），保留 dict / cache container / segmenter。
+    reset_per_doc();
+    if (OB_FAIL(init_ctx(param))) {
+    } else {
+      // 清空 4 个处理器跨文档累计的 mutable 状态，避免词边界泄漏到下一文档。
+      for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+           OB_SUCC(ret) && iter != segmenters_.end();
+           iter++) {
+        (*iter)->reuse();
+      }
+    }
+  }
+  return ret;
+}
+
+void ObIKFTParser::reset_per_doc()
+{
+  if (!OB_ISNULL(ctx_)) {
+    ctx_->~TokenizeContext();
+    if (OB_NOT_NULL(ctx_alloc_)) {
+      ctx_alloc_->free(ctx_);
+    }
+    ctx_ = nullptr;
+    ctx_alloc_ = nullptr;
+  }
 }
 
 int ObIKFTParser::get_next_token(const char *&word,
@@ -178,9 +236,11 @@ int ObIKFTParser::process_next_batch()
     }
 
     if (OB_SUCC(ret) || OB_ITER_END == ret) {
-      ObIKArbitrator arb;
-      if (OB_FAIL(arb.process(*ctx_))) {
-      } else if (OB_FAIL(arb.output_result(*ctx_))) {
+      // 复用 arbitrator：reuse() 清空上批次 hashmap node 并重置 arena 游标，避免每 batch
+      // 重建 bucket 数组与 arena page。
+      arb_.reuse();
+      if (OB_FAIL(arb_.process(*ctx_))) {
+      } else if (OB_FAIL(arb_.output_result(*ctx_))) {
       }
     } else {
       // Already logged.
@@ -193,20 +253,45 @@ int ObIKFTParser::process_next_batch()
 int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) const
 {
   int ret = OB_SUCCESS;
-  ObIKFTParser *parser = nullptr;
   ObFTDictHub *hub = nullptr;
+  iter = nullptr;
   if (OB_ISNULL(param) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(param->cs_) || OB_ISNULL(param->cs_->name)) {
+    ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
-  } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser->init(*param))) {
   } else {
-    iter = parser;
-  }
-
-  if (OB_FAIL(ret)) {
-    OB_DELETEx(ObIKFTParser, param->allocator_, parser);
+    const ObCollationType coll_type = ObCharset::collation_type(param->cs_->name);
+    if (CS_TYPE_INVALID == coll_type) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      ObIKFTParserReusePool &pool = g_ik_parser_pool;
+      const uint8_t ik_mode = static_cast<uint8_t>(param->ik_param_.mode_);
+      // 命中复用池：只重建 ctx + reset 处理器，跳过字典加载等重活。
+      if (OB_NOT_NULL(pool.parser_) && pool.coll_type_ == coll_type && pool.ik_mode_ == ik_mode) {
+        if (OB_FAIL(pool.parser_->reuse_init(*param))) {
+          // 复用失败（罕见）：销毁后走完整重建分支。
+          pool.parser_->~ObIKFTParser();
+          pool.parser_ = nullptr;
+        } else {
+          iter = pool.parser_;
+        }
+      }
+      // 未命中或复用失败：完整 init 并缓存。
+      if (OB_SUCC(ret) && OB_ISNULL(iter)) {
+        ObIKFTParser *parser = nullptr;
+        if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, &pool.arena_, pool.arena_, hub))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(parser->init(*param))) {
+          OB_DELETEx(ObIKFTParser, &pool.arena_, parser);
+        } else {
+          pool.parser_ = parser;
+          pool.coll_type_ = coll_type;
+          pool.ik_mode_ = ik_mode;
+          iter = parser;
+        }
+      }
+    }
   }
 
   return ret;
@@ -215,8 +300,12 @@ int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) c
 void ObIKFTParserDesc::free_token_iter(ObFTParserParam *param,
                                        ObITokenIterator *&iter) const
 {
-  iter->~ObITokenIterator();
-  param->allocator_->free(iter);
+  UNUSED(param);
+  if (OB_NOT_NULL(iter)) {
+    // 归还语义：只释放 per-document 状态（ctx），dict / segmenter 留在复用池继续用。
+    static_cast<ObIKFTParser *>(iter)->reset_per_doc();
+    iter = nullptr;
+  }
 }
 
 
@@ -292,9 +381,9 @@ int ObIKFTParser::init_ctx(const ObFTParserParam &param)
   if (coll_type_ == common::CS_TYPE_INVALID) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(ctx_ = OB_NEWx(TokenizeContext,
-                                      &allocator_,
+                                      param.allocator_,
                                       coll_type_,
-                                      allocator_,
+                                      *(param.allocator_),
                                       param.fulltext_,
                                       param.ft_length_,
                                       param.ik_param_.mode_ == ObFTIKParam::Mode::SMART))) {
@@ -302,7 +391,11 @@ int ObIKFTParser::init_ctx(const ObFTParserParam &param)
   } else if (OB_FAIL(ctx_->init())) {
   }
   if (OB_FAIL(ret)) {
-    OB_DELETEx(TokenizeContext, &allocator_, ctx_);
+    OB_DELETEx(TokenizeContext, param.allocator_, ctx_);
+    ctx_alloc_ = nullptr;
+  } else {
+    // ctx 用 per-query 的 param->allocator_ 分配，随一次 segment 调用释放，避免复用池 arena 增长。
+    ctx_alloc_ = param.allocator_;
   }
   return ret;
 }
@@ -351,7 +444,11 @@ void ObIKFTParser::reset()
 {
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
-    allocator_.free(ctx_);
+    if (OB_NOT_NULL(ctx_alloc_)) {
+      ctx_alloc_->free(ctx_);
+    }
+    ctx_ = nullptr;
+    ctx_alloc_ = nullptr;
   }
 
   for (ObIIKProcessor *segmenter : segmenters_) {
